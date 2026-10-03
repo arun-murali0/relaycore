@@ -1,0 +1,97 @@
+name: Main - scheduled full checks
+
+# Heavy checks run 4x/day on main, NOT on every push.
+on:
+  schedule:
+    - cron: "0 0,6,12,18 * * *"   # UTC
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Run even if main is unchanged since last green run"
+        type: boolean
+        default: false
+
+concurrency:
+  group: scheduled-main
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  full:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    services:
+      mongo:
+        image: mongo:7
+        ports: ["27017:27017"]
+        options: >-
+          --health-cmd "mongosh --quiet --eval 'db.runCommand({ping:1})'"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      MONGO_URI: mongodb://localhost:27017/relaycore_test
+      REDIS_URL: redis://localhost:6379
+    steps:
+      - uses: actions/checkout@v4
+
+      # Skip-if-unchanged: a marker is cached per commit SHA after a green run.
+      # Hit = this exact commit already passed the full suite.
+      - name: Check if this commit already passed
+        id: done
+        uses: actions/cache@v4
+        with:
+          path: .ci-marker
+          key: full-ok-${{ github.sha }}
+
+      - name: Decide
+        id: gate
+        run: |
+          if [ "${{ steps.done.outputs.cache-hit }}" = "true" ] && [ "${{ inputs.force }}" != "true" ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "main unchanged since last green run - skipping"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/setup-node@v4
+        if: steps.gate.outputs.run == 'true'
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install
+        if: steps.gate.outputs.run == 'true'
+        run: npm ci --prefer-offline --no-audit --no-fund
+
+      - name: Typecheck + unit tests
+        if: steps.gate.outputs.run == 'true'
+        run: |
+          npm run typecheck
+          npm test
+
+      - name: Integration tests (real Mongo + Redis)
+        if: steps.gate.outputs.run == 'true'
+        run: npm run test:integration
+
+      # Runs only once you add a Dockerfile (phase 9).
+      - uses: docker/setup-buildx-action@v3
+        if: steps.gate.outputs.run == 'true' && hashFiles('Dockerfile') != ''
+      - uses: docker/build-push-action@v6
+        if: steps.gate.outputs.run == 'true' && hashFiles('Dockerfile') != ''
+        with:
+          context: .
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Written last so the cache is saved ONLY after everything above passed.
+      - name: Mark commit green
+        if: steps.gate.outputs.run == 'true'
+        run: mkdir -p .ci-marker && echo "${{ github.sha }}" > .ci-marker/ok

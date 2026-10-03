@@ -1,0 +1,67 @@
+name: CI
+
+# Runs ONLY on feature-style branches. Nothing runs on push to main.
+on:
+  push:
+    branches: ["feature/**", "fix/**", "chore/**"]
+  workflow_dispatch:
+
+# New push to the same branch cancels the older run -> no wasted minutes.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # The job name "ci" is what branch protection requires. Do not rename it
+  # without updating the ruleset on main.
+  ci:
+    name: ci
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm            # caches ~/.npm keyed on package-lock.json
+
+      - name: Install (from cache when lockfile unchanged)
+        run: npm ci --prefer-offline --no-audit --no-fund
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Unit tests
+        run: npm test
+
+      - name: Build
+        run: npm run build
+
+  # Only reached if `ci` passed. Opens a PR (if needed) and squash-merges it.
+  automerge:
+    name: automerge
+    needs: ci
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+      pull-requests: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      BRANCH: ${{ github.ref_name }}
+    steps:
+      - name: Open PR if none exists
+        run: |
+          existing=$(gh pr list --repo "$REPO" --head "$BRANCH" --base main --state open --json number --jq '.[0].number')
+          if [ -z "$existing" ]; then
+            gh pr create --repo "$REPO" --base main --head "$BRANCH" \
+              --title "Merge $BRANCH" --body "Auto-created after CI passed."
+          fi
+
+      - name: Squash-merge into main
+        run: gh pr merge "$BRANCH" --repo "$REPO" --squash --delete-branch
